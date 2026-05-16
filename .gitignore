@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+
+# Databricks
+.databricks/
+*.dbignore
+
+# Environment / secrets — NEVER commit these
+.env
+.env.*
+secrets/
+*.key
+*.pem
+keys_curls
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# OS
+Thumbs.db
+
+# Worktrees from agent builds
+.claude/
