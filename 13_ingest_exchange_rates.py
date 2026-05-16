@@ -3,14 +3,19 @@
 # MAGIC %md
 # MAGIC # Ingest COP/USD Exchange Rates
 # MAGIC
-# MAGIC Source: [frankfurter.app](https://www.frankfurter.app/) — free, no API key.
+# MAGIC Source: **Yahoo Finance** via the `yfinance` library — free, no API key, supports
+# MAGIC the `USDCOP=X` FX pair which returns COP per 1 USD (matching the bronze schema).
 # MAGIC
-# MAGIC The bronze table stores the rate as **COP per 1 USD**. Frankfurter returns
-# MAGIC USD per 1 COP, so we invert: `rate = 1 / response.rates['USD']`.
+# MAGIC (frankfurter.app does not support COP — it only covers ECB-reference currencies.)
 # MAGIC
-# MAGIC Incremental: on first run fetches 2 years of history (skipping weekends —
-# MAGIC frankfurter only publishes weekday rates). Subsequent runs fetch from
+# MAGIC Incremental: on first run fetches 2 years of history. Subsequent runs fetch from
 # MAGIC `max(date) + 1` to yesterday.
+
+# COMMAND ----------
+
+# DBTITLE 1,Install yfinance
+# MAGIC %pip install yfinance
+# MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
 
@@ -19,43 +24,17 @@
 # COMMAND ----------
 
 # DBTITLE 1,Imports and config
-import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-import requests
+import pandas as pd
+import yfinance as yf
 
 TARGET_TABLE = "realestate.bronze.exchange_rates"
 FROM_CURRENCY = "COP"
 TO_CURRENCY = "USD"
+TICKER = "USDCOP=X"           # Yahoo: USD/COP — Close column is COP per 1 USD
 INITIAL_HISTORY_DAYS = 365 * 2
-REQUEST_SLEEP_SECONDS = 0.2
-REQUEST_TIMEOUT_SECONDS = 30
-
-# COMMAND ----------
-
-# DBTITLE 1,Fetch single-date rate from frankfurter
-def fetch_rate_for_date(target_date: date) -> Optional[float]:
-    """Return COP-per-USD rate for the given date, or None if no data.
-
-    frankfurter returns USD-per-COP; we invert.
-    """
-    url = f"https://api.frankfurter.app/{target_date.isoformat()}"
-    params = {"from": FROM_CURRENCY, "to": TO_CURRENCY}
-    try:
-        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
-    except Exception as e:
-        print(f"  [{target_date}] request failed: {type(e).__name__}: {e}")
-        return None
-
-    if resp.status_code != 200:
-        return None
-
-    body = resp.json()
-    usd_per_cop = body.get("rates", {}).get(TO_CURRENCY)
-    if not usd_per_cop:
-        return None
-    return 1.0 / float(usd_per_cop)
 
 # COMMAND ----------
 
@@ -70,56 +49,73 @@ def get_existing_max_date() -> Optional[date]:
     return row["max_date"]
 
 
-def iter_dates_to_fetch():
-    """Yield weekday dates from (max+1 or 2yr ago) through yesterday."""
+def compute_start_end() -> tuple[date, date]:
     yesterday = date.today() - timedelta(days=1)
     max_existing = get_existing_max_date()
     if max_existing is None:
         start = date.today() - timedelta(days=INITIAL_HISTORY_DAYS)
-        print(f"Bootstrapping: fetching {INITIAL_HISTORY_DAYS} days of history")
+        print(f"Bootstrapping: fetching {INITIAL_HISTORY_DAYS} days of history "
+              f"({start} → {yesterday})")
     else:
         start = max_existing + timedelta(days=1)
         print(f"Incremental: fetching from {start} through {yesterday}")
+    return start, yesterday
 
-    current = start
-    while current <= yesterday:
-        # Skip weekends — frankfurter only publishes weekday rates.
-        if current.weekday() < 5:
-            yield current
-        current += timedelta(days=1)
+# COMMAND ----------
+
+# DBTITLE 1,Fetch USDCOP history from Yahoo Finance
+def fetch_history(start: date, end: date) -> pd.DataFrame:
+    # yfinance end date is exclusive — bump by 1 to include the requested end.
+    end_exclusive = end + timedelta(days=1)
+    ticker = yf.Ticker(TICKER)
+    hist = ticker.history(start=start.isoformat(), end=end_exclusive.isoformat())
+    if hist.empty:
+        return hist
+    # Keep only Close (COP per 1 USD) and ensure tz-naive date index.
+    hist = hist[["Close"]].copy()
+    hist.index = pd.to_datetime(hist.index).tz_localize(None).date
+    return hist
 
 # COMMAND ----------
 
 # DBTITLE 1,Run ingestion
 def run_ingest() -> int:
-    rows = []
-    now = datetime.utcnow()
-    skipped = 0
-    fetched = 0
+    start, end = compute_start_end()
+    if start > end:
+        print(f"Already current through {end}. Nothing to fetch.")
+        return 0
 
-    for d in iter_dates_to_fetch():
-        rate = fetch_rate_for_date(d)
-        if rate is None:
-            skipped += 1
-        else:
-            rows.append({
-                "rate_date": d,
-                "from_currency": FROM_CURRENCY,
-                "to_currency": TO_CURRENCY,
-                "rate": rate,
-                "ingest_time": now,
-            })
-            fetched += 1
-        time.sleep(REQUEST_SLEEP_SECONDS)
+    hist = fetch_history(start, end)
+    if hist.empty:
+        print("Yahoo Finance returned no rows. Try again later or widen the date range.")
+        return 0
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    rows = []
+    for idx_date, row in hist.iterrows():
+        try:
+            rate = float(row["Close"])
+        except (TypeError, ValueError):
+            continue
+        if not rate or rate != rate:   # filter NaN
+            continue
+        rows.append({
+            "rate_date": idx_date,
+            "from_currency": FROM_CURRENCY,
+            "to_currency": TO_CURRENCY,
+            "rate": rate,
+            "ingest_time": now,
+        })
 
     if not rows:
-        print(f"No new rates fetched (skipped={skipped}).")
+        print("No usable rate rows after parsing.")
         return 0
 
     df = spark.createDataFrame(rows)
     df.write.mode("append").saveAsTable(TARGET_TABLE)
-    print(f"Inserted {fetched} new rate rows (skipped {skipped} dates without data).")
-    return fetched
+    print(f"Inserted {len(rows)} rate rows "
+          f"(date range: {rows[0]['rate_date']} → {rows[-1]['rate_date']})")
+    return len(rows)
 
 
 inserted = run_ingest()
