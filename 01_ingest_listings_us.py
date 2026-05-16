@@ -46,21 +46,22 @@ TARGET_TABLE = "realestate.bronze.listings_us"
 
 # RapidAPI host + endpoint for the Zillow scraper.
 #
-# Endpoint chosen from the RapidAPI test console for
-# `zillow-com-live-data-scraper-api`. The provider exposes several search
-# endpoints; the city-wide for-sale search currently lives at:
+# Provider: `zillow-com-live-data-scraper-api`. The city-wide search endpoint
+# is `/bylocation` (listed under "Properties" in the RapidAPI sidebar). It
+# takes a kebab-cased `location` ({city}-{state}, lowercased) and a `page`.
 #
-#     GET https://zillow-com-live-data-scraper-api.p.rapidapi.com/propertyExtendedSearch
-#         ?location=<city, state>
-#         &status_type=ForSale
+#     GET https://zillow-com-live-data-scraper-api.p.rapidapi.com/bylocation
+#         ?location=austin-tx
 #         &page=<n>
 #
-# If the provider renames the path (e.g. to `/byCity`, `/properties`,
-# `/search`, `/searchByCity`), update `RAPIDAPI_SEARCH_PATH` below. The
-# `x-rapidapi-host` header should always match the subscription's host string
-# exactly as shown on the RapidAPI dashboard.
+# Other Properties endpoints on this provider for reference:
+#   /bymlsid       — by MLS ID
+#   /bymapbounds   — by lat/lon bounding box
+#   /bypolygon     — by polygon
+#   /bycoordinates — by lat/lon point
+#   /byurl         — by Zillow URL
 RAPIDAPI_HOST = "zillow-com-live-data-scraper-api.p.rapidapi.com"
-RAPIDAPI_SEARCH_PATH = "/propertyExtendedSearch"
+RAPIDAPI_SEARCH_PATH = "/bylocation"
 RAPIDAPI_SEARCH_URL = f"https://{RAPIDAPI_HOST}{RAPIDAPI_SEARCH_PATH}"
 
 # Pull the API key once at the top of the run.
@@ -165,14 +166,26 @@ def _parse_listing_date(value):
 
 # COMMAND ----------
 
-# DBTITLE 1,Fetch one page from the Zillow search endpoint
-def fetch_listings_page(location: str, page: int) -> tuple[int, dict]:
+# DBTITLE 1,Fetch one page from the Zillow /bylocation endpoint
+def _format_location(city: str, state: str = "") -> str:
+    """Convert 'Austin, TX' or ('Austin','TX') to the kebab-case 'austin-tx'
+    format the provider expects."""
+    parts = []
+    if city:
+        parts.extend(city.replace(",", "").split())
+    if state:
+        parts.append(state)
+    slug = "-".join(p.lower() for p in parts if p)
+    return slug
+
+
+def fetch_listings_page(location_slug: str, page: int) -> tuple[int, dict]:
     """
-    Call the RapidAPI Zillow scraper search endpoint for one (city, page).
+    Call /bylocation for one (location_slug, page).
 
     Returns:
-        (status_code, response_json). On non-200 responses the JSON dict is
-        `{"error": ..., "status_code": ...}` so the caller can still record it.
+        (status_code, response_json). On non-200 the JSON dict is an error
+        envelope so the caller can still log it.
     """
     headers = {
         "x-rapidapi-host": RAPIDAPI_HOST,
@@ -180,8 +193,7 @@ def fetch_listings_page(location: str, page: int) -> tuple[int, dict]:
         "accept": "application/json",
     }
     params = {
-        "location": location,
-        "status_type": "ForSale",
+        "location": location_slug,
         "page": page,
     }
 
@@ -210,23 +222,40 @@ def fetch_listings_page(location: str, page: int) -> tuple[int, dict]:
 
 def extract_results(page_payload: dict) -> list:
     """
-    Dig the listing array out of the response. The Zillow scraper has used
-    several wrappers across versions: top-level `props`, `results`, or
-    `data.results`. Try each in turn.
+    Pull the listing array out of the response. /bylocation typically returns:
+        {"results": [...], "pagination": {...}}
+    but we also try `properties`, `data`, `props`, and `listings` for safety.
     """
+    if isinstance(page_payload, list):
+        return page_payload
     if not isinstance(page_payload, dict):
         return []
-    for key in ("props", "results", "listings"):
+    for key in ("results", "properties", "props", "listings", "data"):
         value = page_payload.get(key)
         if isinstance(value, list):
             return value
+    # Try one level of nesting (data.results, data.properties, etc).
     data = page_payload.get("data")
     if isinstance(data, dict):
-        for key in ("results", "props", "listings"):
+        for key in ("results", "properties", "props", "listings"):
             value = data.get(key)
             if isinstance(value, list):
                 return value
     return []
+
+
+def extract_total_pages(page_payload: dict) -> int | None:
+    """Return total_pages from the pagination object, or None if absent."""
+    if not isinstance(page_payload, dict):
+        return None
+    pag = page_payload.get("pagination")
+    if not isinstance(pag, dict):
+        return None
+    val = pag.get("total_pages") or pag.get("totalPages")
+    try:
+        return int(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
 
 # COMMAND ----------
 
@@ -397,13 +426,21 @@ def upsert_listings(rows: list) -> tuple[int, int]:
 # Refresh every city we've ever ingested, plus the example list. Distinct
 # (city, state) tuples are taken from bronze so we can pass the city alone if
 # state is missing.
+# Default state per example city so the location slug is correct.
+DEFAULT_CITY_STATE = {
+    "Austin":  "TX",
+    "Miami":   "FL",
+    "Atlanta": "GA",
+    "Houston": "TX",
+}
+
 existing_locations = spark.sql(f"""
     SELECT DISTINCT city, state
     FROM {TARGET_TABLE}
     WHERE city IS NOT NULL AND TRIM(city) != ''
 """).collect()
 
-locations_to_fetch = []
+locations_to_fetch = []  # list of (display, slug) tuples
 seen = set()
 
 for row in existing_locations:
@@ -411,21 +448,25 @@ for row in existing_locations:
     state = (row["state"] or "").strip() if row["state"] else ""
     if not city:
         continue
-    location = f"{city}, {state}" if state else city
-    if location.lower() in seen:
+    slug = _format_location(city, state)
+    if slug in seen:
         continue
-    seen.add(location.lower())
-    locations_to_fetch.append(location)
+    seen.add(slug)
+    display_name = f"{city}, {state}" if state else city
+    locations_to_fetch.append((display_name, slug))
 
 for city in EXAMPLE_CITIES:
-    if city.lower() in seen:
+    state = DEFAULT_CITY_STATE.get(city, "")
+    slug = _format_location(city, state)
+    if slug in seen:
         continue
-    seen.add(city.lower())
-    locations_to_fetch.append(city)
+    seen.add(slug)
+    display_name = f"{city}, {state}" if state else city
+    locations_to_fetch.append((display_name, slug))
 
 print(f"Cities to fetch this run ({len(locations_to_fetch)}):")
-for loc in locations_to_fetch:
-    print(f"  - {loc}")
+for display_name, slug in locations_to_fetch:
+    print(f"  - {display_name}  →  {slug}")
 
 # COMMAND ----------
 
@@ -435,22 +476,32 @@ total_inserted = 0
 total_updated = 0
 total_filtered = 0
 
-for location in locations_to_fetch:
-    print(f"\n=== {location} ===")
+for display_name, slug in locations_to_fetch:
+    print(f"\n=== {display_name}  (slug: {slug}) ===")
     city_inserted = 0
     city_updated = 0
     city_filtered = 0
     city_errors = []
 
-    for page in range(1, MAX_PAGES_PER_CITY + 1):
+    total_pages_hint = MAX_PAGES_PER_CITY  # updated after page 1
+
+    for page in range(1, total_pages_hint + 1):
         try:
             time.sleep(REQUEST_DELAY_SECONDS)
-            status_code, payload = fetch_listings_page(location, page)
+            status_code, payload = fetch_listings_page(slug, page)
             print(f"  page {page}: HTTP {status_code}")
 
             if status_code != 200:
                 city_errors.append(f"page {page}: HTTP {status_code}")
                 break
+
+            # On page 1, refine total_pages_hint from the provider's pagination.
+            if page == 1:
+                provider_total = extract_total_pages(payload)
+                if provider_total is not None:
+                    total_pages_hint = min(provider_total, MAX_PAGES_PER_CITY)
+                    print(f"  pagination: {provider_total} total pages "
+                          f"(capped at {MAX_PAGES_PER_CITY})")
 
             results = extract_results(payload)
             if not results:
@@ -472,12 +523,6 @@ for location in locations_to_fetch:
             city_updated += updated
             print(f"  page {page}: parsed={len(rows)} inserted={inserted} updated={updated}")
 
-            # If the provider gave us fewer than a typical page-worth, assume
-            # we've hit the end and avoid burning more requests.
-            if len(results) < 20:
-                print(f"  page {page}: short page — assuming end of results")
-                break
-
         except Exception:
             err = traceback.format_exc()
             print(f"  page {page}: FAILED\n{err.splitlines()[-1]}")
@@ -489,7 +534,7 @@ for location in locations_to_fetch:
     total_filtered += city_filtered
 
     run_summary.append({
-        "location": location,
+        "location": display_name,
         "inserted": int(city_inserted),
         "updated": int(city_updated),
         "rentals_filtered": int(city_filtered),
