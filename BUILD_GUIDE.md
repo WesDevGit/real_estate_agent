@@ -147,15 +147,15 @@ incremental from `max(date) + 1` to yesterday.
 Bootstrapping: fetching 730 days of history
 Inserted 521 new rate rows (skipped 0 dates without data).
 
-+----------+---------+
-|rate_date | rate    |
-+----------+---------+
-|2026-05-14|3958.21  |
-|2026-05-13|3961.07  |
-|2026-05-12|3970.40  |
-|2026-05-09|3982.13  |
-|2026-05-08|3985.51  |
-+----------+---------+
++----------+--------+
+|date      |rate    |
++----------+--------+
+|2026-05-14|3958.21 |
+|2026-05-13|3961.07 |
+|2026-05-12|3970.40 |
+|2026-05-09|3982.13 |
+|2026-05-08|3985.51 |
++----------+--------+
 ```
 
 The exact rate values will differ — they're the live COP/USD rate (COP per 1 USD,
@@ -164,8 +164,8 @@ typically 3,800–4,300 as of 2026).
 **Validation:**
 ```sql
 SELECT COUNT(*) AS row_count,
-       MIN(rate_date) AS earliest,
-       MAX(rate_date) AS latest,
+       MIN(date) AS earliest,
+       MAX(date) AS latest,
        AVG(rate) AS avg_cop_per_usd
 FROM realestate.bronze.exchange_rates
 WHERE from_currency = 'COP' AND to_currency = 'USD';

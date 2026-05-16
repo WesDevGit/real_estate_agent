@@ -44,9 +44,9 @@ spark.sql("USE CATALOG realestate")
 # Databricks Secrets scope shared by every notebook in this agent.
 SECRETS_SCOPE = "realestate"
 
-# Fully qualified bronze table holding daily FX rates. Rows are expected to be
-# stored as COP per 1 USD with columns: from_currency, to_currency, rate,
-# rate_date (or ingest_time). Most recent row by rate_date wins.
+# Fully qualified bronze table holding daily FX rates. Rows are stored as
+# COP per 1 USD with columns: date, from_currency, to_currency, rate, ingested_at.
+# Most recent row by `date` wins.
 EXCHANGE_RATES_TABLE = "realestate.bronze.exchange_rates"
 
 # Nominatim public endpoint. Free use is limited to 1 request/second and
@@ -163,9 +163,9 @@ def _latest_cop_per_usd_rate() -> float:
     Return the most recent COP-per-USD rate from the bronze exchange table.
 
     The bronze table is expected to store rows like:
-        from_currency='COP', to_currency='USD', rate=<COP per 1 USD>
-    Most-recent is determined by `rate_date` when present, otherwise by
-    `ingest_time` as a fallback.
+        date=<rate date>, from_currency='COP', to_currency='USD',
+        rate=<COP per 1 USD>, ingested_at=<ingest timestamp>
+    Most-recent is determined by `date`, with `ingested_at` as a tiebreaker.
 
     Raises:
         ValueError: If no matching row is found.
@@ -175,7 +175,7 @@ def _latest_cop_per_usd_rate() -> float:
         SELECT rate
         FROM {EXCHANGE_RATES_TABLE}
         WHERE from_currency = 'COP' AND to_currency = 'USD'
-        ORDER BY COALESCE(rate_date, ingest_time) DESC
+        ORDER BY date DESC, ingested_at DESC
         LIMIT 1
         """
     )

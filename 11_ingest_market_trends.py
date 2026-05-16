@@ -196,7 +196,7 @@ def ingest_files(volume: str, parser, table: str, label: str) -> int:
         if not rows:
             continue
         for r in rows:
-            r["ingest_time"] = now
+            r["ingested_at"] = now
         df = spark.createDataFrame(rows)
         df.createOrReplaceTempView("_new_market_trends")
         if "source" in df.columns:

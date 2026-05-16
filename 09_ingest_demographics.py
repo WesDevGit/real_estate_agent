@@ -177,7 +177,7 @@ def run_us_ingest() -> int:
 
     now = datetime.utcnow()
     for r in all_rows:
-        r["ingest_time"] = now
+        r["ingested_at"] = now
 
     # Upsert via merge — but for first build we just overwrite by (geo_id, year).
     df = spark.createDataFrame(all_rows)

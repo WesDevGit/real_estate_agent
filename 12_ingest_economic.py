@@ -149,7 +149,7 @@ def run_us_ingest() -> int:
                 "job_growth_yoy_pct": None,
                 "median_wage_usd": None,
                 "mortgage_rate_30yr": mortgage,
-                "ingest_time": now,
+                "ingested_at": now,
             })
 
     if not rows:

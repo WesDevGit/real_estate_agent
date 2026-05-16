@@ -41,7 +41,7 @@ INITIAL_HISTORY_DAYS = 365 * 2
 # DBTITLE 1,Determine date range to fetch
 def get_existing_max_date() -> Optional[date]:
     row = spark.sql(
-        f"SELECT MAX(rate_date) AS max_date FROM {TARGET_TABLE} "
+        f"SELECT MAX(date) AS max_date FROM {TARGET_TABLE} "
         f"WHERE from_currency = '{FROM_CURRENCY}' AND to_currency = '{TO_CURRENCY}'"
     ).first()
     if row is None or row["max_date"] is None:
@@ -100,21 +100,22 @@ def run_ingest() -> int:
         if not rate or rate != rate:   # filter NaN
             continue
         rows.append({
-            "rate_date": idx_date,
+            "date": idx_date,
             "from_currency": FROM_CURRENCY,
             "to_currency": TO_CURRENCY,
             "rate": rate,
-            "ingest_time": now,
+            "ingested_at": now,
         })
 
     if not rows:
         print("No usable rate rows after parsing.")
         return 0
 
-    df = spark.createDataFrame(rows)
+    # Match the schema column order: date, from_currency, to_currency, rate, ingested_at
+    df = spark.createDataFrame(rows).select("date", "from_currency", "to_currency", "rate", "ingested_at")
     df.write.mode("append").saveAsTable(TARGET_TABLE)
     print(f"Inserted {len(rows)} rate rows "
-          f"(date range: {rows[0]['rate_date']} → {rows[-1]['rate_date']})")
+          f"(date range: {rows[0]['date']} → {rows[-1]['date']})")
     return len(rows)
 
 
@@ -124,7 +125,7 @@ inserted = run_ingest()
 
 # DBTITLE 1,Verify latest rate
 spark.sql(
-    f"SELECT rate_date, rate FROM {TARGET_TABLE} "
+    f"SELECT date, rate FROM {TARGET_TABLE} "
     f"WHERE from_currency='{FROM_CURRENCY}' AND to_currency='{TO_CURRENCY}' "
-    f"ORDER BY rate_date DESC LIMIT 5"
+    f"ORDER BY date DESC LIMIT 5"
 ).show()

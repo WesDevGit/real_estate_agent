@@ -180,7 +180,7 @@ def run_ingest() -> int:
             continue
 
         for r in rows:
-            r["ingest_time"] = now
+            r["ingested_at"] = now
 
         df = spark.createDataFrame(rows)
         df.createOrReplaceTempView("_new_amenities")

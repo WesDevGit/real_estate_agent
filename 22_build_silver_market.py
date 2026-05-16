@@ -28,7 +28,7 @@ def get_latest_cop_per_usd_rate() -> float:
         return float(spark.sql(
             "SELECT rate FROM realestate.bronze.exchange_rates "
             "WHERE from_currency='COP' AND to_currency='USD' "
-            "ORDER BY COALESCE(rate_date, ingest_time) DESC LIMIT 1"
+            "ORDER BY date DESC, ingested_at DESC LIMIT 1"
         ).first()["rate"])
     except Exception:
         return None
